@@ -66,6 +66,7 @@ int run_page_contents(fz_context *ctx, fz_page *page, fz_device *dev, fz_matrix 
 import "C"
 
 import (
+	"fmt"
 	"image"
 	"io"
 	"os"
@@ -189,18 +190,48 @@ func (f *Document) Image(pageNumber int) (*image.RGBA, error) {
 	return f.ImageDPI(pageNumber, 300.0)
 }
 
+var prevPixmap = map[unsafe.Pointer]*C.fz_pixmap{}
+
+// FreeImage frees the image data when using ImageDPIRaw
+func (f *Document) FreeImage(ptr unsafe.Pointer) error {
+	pixmap, ok := prevPixmap[ptr]
+	if !ok {
+		return fmt.Errorf("pixmap not found")
+	}
+
+	C.fz_drop_pixmap(f.ctx, pixmap)
+	return nil
+}
+
 // ImageDPI returns image for given page number and DPI.
+// If performance is a concern, use ImageDPIRaw instead
 func (f *Document) ImageDPI(pageNumber int, dpi float64) (*image.RGBA, error) {
+	rect, pixels, sz, err := f.ImageDPIRaw(pageNumber, dpi)
+	if err != nil {
+		return nil, err
+	}
+
+	img := image.NewRGBA(rect)
+	copy(img.Pix, C.GoBytes(pixels, C.int(sz)))
+
+	f.FreeImage(pixels)
+
+	return img, nil
+}
+
+// ImageDPI returns Image Rect, size and raw data for given page number and DPI.
+// Caller must call FreeImage to free the image data
+func (f *Document) ImageDPIRaw(pageNumber int, dpi float64) (image.Rectangle, unsafe.Pointer, int, error) {
 	f.mtx.Lock()
 	defer f.mtx.Unlock()
 
 	if pageNumber >= f.NumPage() {
-		return nil, ErrPageMissing
+		return image.Rectangle{}, nil, 0, ErrPageMissing
 	}
 
 	page := C.load_page(f.ctx, f.doc, C.int(pageNumber))
 	if page == nil {
-		return nil, ErrLoadPage
+		return image.Rectangle{}, nil, 0, ErrLoadPage
 	}
 
 	defer C.fz_drop_page(f.ctx, page)
@@ -217,11 +248,10 @@ func (f *Document) ImageDPI(pageNumber int, dpi float64) (*image.RGBA, error) {
 
 	pixmap := C.fz_new_pixmap_with_bbox(f.ctx, C.fz_device_rgb(f.ctx), bbox, nil, 1)
 	if pixmap == nil {
-		return nil, ErrCreatePixmap
+		return image.Rectangle{}, nil, 0, ErrCreatePixmap
 	}
 
 	C.fz_clear_pixmap_with_value(f.ctx, pixmap, C.int(0xff))
-	defer C.fz_drop_pixmap(f.ctx, pixmap)
 
 	device := C.fz_new_draw_device(f.ctx, ctm, pixmap)
 	C.fz_enable_device_hints(f.ctx, device, C.FZ_NO_CACHE)
@@ -230,20 +260,26 @@ func (f *Document) ImageDPI(pageNumber int, dpi float64) (*image.RGBA, error) {
 	drawMatrix := C.fz_identity
 	ret := C.run_page_contents(f.ctx, page, device, drawMatrix, nil)
 	if ret == 0 {
-		return nil, ErrRunPageContents
+		return image.Rectangle{}, nil, 0, ErrRunPageContents
 	}
 
 	C.fz_close_device(f.ctx, device)
 
 	pixels := C.fz_pixmap_samples(f.ctx, pixmap)
 	if pixels == nil {
-		return nil, ErrPixmapSamples
+		return image.Rectangle{}, nil, 0, ErrPixmapSamples
 	}
 
-	img := image.NewRGBA(image.Rect(int(bbox.x0), int(bbox.y0), int(bbox.x1), int(bbox.y1)))
-	copy(img.Pix, C.GoBytes(unsafe.Pointer(pixels), C.int(4*bbox.x1*bbox.y1)))
+	prevPixmap[unsafe.Pointer(pixels)] = pixmap
 
-	return img, nil
+	// avoid copying the data, just return the pointer
+	// profiling this function shows that the copy and image creation is about 40% of the time spent when
+	// rapidly switching pages in an OpenGL viewer
+
+	// img := image.NewRGBA(image.Rect(int(bbox.x0), int(bbox.y0), int(bbox.x1), int(bbox.y1)))
+	// copy(img.Pix, C.GoBytes(unsafe.Pointer(pixels), C.int(4*bbox.x1*bbox.y1)))
+
+	return image.Rect(int(bbox.x0), int(bbox.y0), int(bbox.x1), int(bbox.y1)), unsafe.Pointer(pixels), int(4 * bbox.x1 * bbox.y1), nil
 }
 
 // ImagePNG returns image for given page number as PNG bytes.
